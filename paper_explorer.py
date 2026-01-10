@@ -24,7 +24,9 @@ class Paper:
     title: str
     authors: List[str]
     year: Optional[int]
+    publication_date: Optional[str]  # Format: YYYY-MM-DD
     citation_count: int
+    url: Optional[str]
     references: List[str] = field(default_factory=list)  # List of paper IDs
     citations: List[str] = field(default_factory=list)   # List of paper IDs
     edge_count: int = 0
@@ -34,7 +36,7 @@ class Paper:
 def fetch_paper_from_semantic_scholar(paper_id: str) -> Optional[dict]:
     """Fetch paper details from Semantic Scholar API."""
     base_url = "https://api.semanticscholar.org/graph/v1/paper"
-    fields = "paperId,title,authors,year,citationCount,references.paperId,references.title,references.authors,references.year,references.citationCount,citations.paperId,citations.title,citations.authors,citations.year,citations.citationCount"
+    fields = "paperId,title,authors,year,publicationDate,citationCount,url,references.paperId,references.title,references.authors,references.year,references.publicationDate,references.citationCount,references.url,citations.paperId,citations.title,citations.authors,citations.year,citations.publicationDate,citations.citationCount,citations.url"
     
     url = f"{base_url}/{paper_id}?fields={fields}"
     
@@ -62,12 +64,17 @@ def add_paper_to_db(paper_data: dict, is_main: bool = False) -> Optional[Paper]:
     
     authors = [a.get('name', 'Unknown') for a in paper_data.get('authors', [])]
     
+    # Build Semantic Scholar URL
+    url = paper_data.get('url') or f"https://www.semanticscholar.org/paper/{paper_id}"
+    
     paper = Paper(
         paper_id=paper_id,
         title=paper_data.get('title', 'Unknown Title'),
         authors=authors[:5],  # Limit to first 5 authors
         year=paper_data.get('year'),
+        publication_date=paper_data.get('publicationDate'),
         citation_count=paper_data.get('citationCount', 0),
+        url=url,
         is_main=is_main
     )
     
@@ -168,7 +175,9 @@ def paper_to_dict(paper: Paper) -> dict:
         'title': paper.title,
         'authors': paper.authors,
         'year': paper.year,
+        'publication_date': paper.publication_date,
         'citation_count': paper.citation_count,
+        'url': paper.url,
         'edge_count': paper.edge_count,
         'is_main': paper.is_main,
         'reference_count': len(paper.references),
@@ -447,6 +456,12 @@ HTML_TEMPLATE = '''
             font-weight: 600;
             color: var(--text-primary);
             flex: 1;
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+
+        .paper-title:hover {
+            color: var(--accent-secondary);
         }
 
         .paper-badges {
@@ -500,6 +515,24 @@ HTML_TEMPLATE = '''
             margin-top: 0.75rem;
             padding-top: 0.75rem;
             border-top: 1px solid var(--border-color);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+        }
+
+        .paper-link {
+            color: var(--accent-secondary);
+            text-decoration: none;
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.8rem;
+            transition: color 0.2s ease;
+        }
+
+        .paper-link:hover {
+            color: var(--accent-primary);
+            text-decoration: underline;
         }
 
         .loading {
@@ -651,14 +684,14 @@ HTML_TEMPLATE = '''
                 <select id="primarySort" onchange="updatePaperList()">
                     <option value="edges">Edges (connections)</option>
                     <option value="citations">Citations</option>
-                    <option value="year">Year</option>
+                    <option value="year">Date</option>
                 </select>
                 
                 <label>Secondary Sort:</label>
                 <select id="secondarySort" onchange="updatePaperList()">
                     <option value="citations">Citations</option>
                     <option value="edges">Edges (connections)</option>
-                    <option value="year">Year</option>
+                    <option value="year">Date</option>
                 </select>
             </div>
             
@@ -774,14 +807,28 @@ HTML_TEMPLATE = '''
                 case 'citations':
                     return (b.citation_count || 0) - (a.citation_count || 0);
                 case 'year':
-                    // Newest first, null years at end
-                    if (a.year === null && b.year === null) return 0;
-                    if (a.year === null) return 1;
-                    if (b.year === null) return -1;
-                    return b.year - a.year;
+                    // Sort by publication_date first (newest first), null dates at end
+                    const dateA = a.publication_date || (a.year ? `${a.year}-01-01` : null);
+                    const dateB = b.publication_date || (b.year ? `${b.year}-01-01` : null);
+                    if (dateA === null && dateB === null) return 0;
+                    if (dateA === null) return 1;
+                    if (dateB === null) return -1;
+                    return dateB.localeCompare(dateA);
                 default:
                     return 0;
             }
+        }
+
+        function formatDate(publicationDate, year) {
+            if (publicationDate) {
+                // Format: YYYY-MM-DD -> Month Day, Year
+                const date = new Date(publicationDate + 'T00:00:00');
+                const options = { year: 'numeric', month: 'short', day: 'numeric' };
+                return date.toLocaleDateString('en-US', options);
+            } else if (year) {
+                return year.toString();
+            }
+            return 'N/A';
         }
 
         function renderPapers(paperList) {
@@ -803,7 +850,7 @@ HTML_TEMPLATE = '''
             container.innerHTML = paperList.map(paper => `
                 <div class="paper-card ${paper.is_main ? 'main-paper' : ''}">
                     <div class="paper-header">
-                        <div class="paper-title">${escapeHtml(paper.title)}</div>
+                        <a href="${paper.url}" target="_blank" class="paper-title">${escapeHtml(paper.title)}</a>
                         <div class="paper-badges">
                             ${paper.is_main ? '<span class="badge badge-main">ADDED</span>' : ''}
                             ${paper.edge_count > 0 ? `<span class="badge badge-edges">${paper.edge_count} edges</span>` : ''}
@@ -811,12 +858,15 @@ HTML_TEMPLATE = '''
                     </div>
                     <div class="paper-authors">${escapeHtml(paper.authors.join(', '))}</div>
                     <div class="paper-meta">
-                        <span>📅 ${paper.year || 'N/A'}</span>
+                        <span>📅 ${formatDate(paper.publication_date, paper.year)}</span>
                         <span>📚 ${paper.citation_count.toLocaleString()} citations</span>
                         ${paper.is_main ? `<span>📖 ${paper.reference_count} refs</span>` : ''}
                         ${paper.is_main ? `<span>🔗 ${paper.citing_count} citing</span>` : ''}
                     </div>
-                    <div class="paper-id">ID: ${paper.paper_id}</div>
+                    <div class="paper-id">
+                        <span>ID: ${paper.paper_id}</span>
+                        <a href="${paper.url}" target="_blank" class="paper-link">View on Semantic Scholar →</a>
+                    </div>
                 </div>
             `).join('');
         }
