@@ -684,14 +684,14 @@ HTML_TEMPLATE = '''
                 <select id="primarySort" onchange="updatePaperList()">
                     <option value="edges">Edges (connections)</option>
                     <option value="citations">Citations</option>
-                    <option value="year">Date</option>
+                    <option value="year">Year</option>
                 </select>
                 
                 <label>Secondary Sort:</label>
                 <select id="secondarySort" onchange="updatePaperList()">
                     <option value="citations">Citations</option>
                     <option value="edges">Edges (connections)</option>
-                    <option value="year">Date</option>
+                    <option value="year">Year</option>
                 </select>
             </div>
             
@@ -807,13 +807,11 @@ HTML_TEMPLATE = '''
                 case 'citations':
                     return (b.citation_count || 0) - (a.citation_count || 0);
                 case 'year':
-                    // Sort by publication_date first (newest first), null dates at end
-                    const dateA = a.publication_date || (a.year ? `${a.year}-01-01` : null);
-                    const dateB = b.publication_date || (b.year ? `${b.year}-01-01` : null);
-                    if (dateA === null && dateB === null) return 0;
-                    if (dateA === null) return 1;
-                    if (dateB === null) return -1;
-                    return dateB.localeCompare(dateA);
+                    // Sort by year only (newest first), null years at end
+                    if (a.year === null && b.year === null) return 0;
+                    if (a.year === null) return 1;
+                    if (b.year === null) return -1;
+                    return b.year - a.year;
                 default:
                     return 0;
             }
