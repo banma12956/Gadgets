@@ -1,0 +1,345 @@
+"""
+Notion Database ArXiv Metadata Fetcher
+
+This script reads a Notion database, finds rows with arXiv links,
+fetches metadata (title, authors, release date) from arXiv,
+and updates the corresponding columns in Notion.
+
+Requirements:
+    pip install notion-client arxiv
+
+Setup:
+    1. Create a Notion integration at https://www.notion.so/my-integrations
+    2. Share your database with the integration
+    3. Set your NOTION_API_KEY environment variable
+    4. Update DATABASE_ID with your database ID
+"""
+
+import os
+import re
+import arxiv
+from notion_client import Client
+from datetime import datetime
+
+
+# Configuration
+NOTION_API_KEY = os.environ.get("NOTION_API_KEY")
+DATABASE_ID = "ID"  # Replace with your database ID
+
+# Column names in your Notion database (adjust if different)
+ARXIV_LINK_COLUMN = "arXiv Link"
+TITLE_COLUMN = "Title"
+AUTHOR_COLUMN = "Author"
+RELEASED_DATE_COLUMN = "released_date"
+
+
+def extract_arxiv_id(url: str) -> str | None:
+    """Extract arXiv ID from various URL formats."""
+    patterns = [
+        r"arxiv\.org/abs/(\d+\.\d+)",
+        r"arxiv\.org/pdf/(\d+\.\d+)",
+        r"arxiv\.org/abs/([a-z-]+/\d+)",
+        r"arxiv\.org/pdf/([a-z-]+/\d+)",
+        r"^(\d+\.\d+)$",
+        r"^([a-z-]+/\d+)$",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+
+def fetch_arxiv_metadata(arxiv_id: str) -> dict | None:
+    """Fetch paper metadata from arXiv API."""
+    try:
+        client = arxiv.Client()
+        search = arxiv.Search(id_list=[arxiv_id])
+        results = list(client.results(search))
+        
+        if not results:
+            print(f"  No results found for arXiv ID: {arxiv_id}")
+            return None
+        
+        paper = results[0]
+        return {
+            "title": paper.title,
+            "authors": ", ".join(author.name for author in paper.authors),
+            "released_date": paper.published.date(),
+        }
+    except Exception as e:
+        print(f"  Error fetching arXiv metadata: {e}")
+        return None
+
+
+def get_property_value(page: dict, property_name: str) -> str | None:
+    """Extract the value from a Notion page property."""
+    props = page.get("properties", {})
+    prop = props.get(property_name, {})
+    prop_type = prop.get("type")
+    
+    if prop_type == "title":
+        title_content = prop.get("title", [])
+        return title_content[0]["plain_text"] if title_content else None
+    elif prop_type == "rich_text":
+        rich_text = prop.get("rich_text", [])
+        return rich_text[0]["plain_text"] if rich_text else None
+    elif prop_type == "url":
+        return prop.get("url")
+    elif prop_type == "date":
+        date_obj = prop.get("date")
+        return date_obj.get("start") if date_obj else None
+    
+    return None
+
+
+def update_notion_page_dynamic(notion: Client, page_id: str, metadata: dict, 
+                               property_types: dict, title_col: str, author_col: str, date_col: str):
+    """Update a Notion page with arXiv metadata using actual column names."""
+    properties = {}
+    
+    # Update Title
+    if property_types[title_col] == "title":
+        properties[title_col] = {
+            "title": [{"text": {"content": metadata["title"]}}]
+        }
+    elif property_types[title_col] == "rich_text":
+        properties[title_col] = {
+            "rich_text": [{"text": {"content": metadata["title"]}}]
+        }
+    
+    # Update Author (truncate to Notion's 2000 char limit)
+    authors = metadata["authors"]
+    if len(authors) > 2000:
+        authors = authors[:1997] + "..."
+
+    if property_types[author_col] == "rich_text":
+        properties[author_col] = {
+            "rich_text": [{"text": {"content": authors}}]
+        }
+    elif property_types[author_col] == "title":
+        properties[author_col] = {
+            "title": [{"text": {"content": authors}}]
+        }
+    
+    # Update Released Date
+    if property_types[date_col] == "date":
+        properties[date_col] = {
+            "date": {"start": metadata["released_date"].isoformat()}
+        }
+    elif property_types[date_col] == "rich_text":
+        properties[date_col] = {
+            "rich_text": [{"text": {"content": metadata["released_date"].isoformat()}}]
+        }
+    
+    notion.pages.update(page_id=page_id, properties=properties)
+
+
+def get_database_property_types(notion: Client, database_id: str) -> dict:
+    """Get the property types for the database columns."""
+    import httpx
+
+    try:
+        database = notion.databases.retrieve(database_id)
+        print(f"Successfully connected to database: {database.get('title', [{}])[0].get('plain_text', 'Untitled')}")
+    except Exception as e:
+        print(f"Error retrieving database: {e}")
+        print(f"\nTroubleshooting tips:")
+        print(f"1. Make sure DATABASE_ID is correct (current: {database_id})")
+        print(f"2. The ID should be 32 characters, like: 1234567890abcdef1234567890abcdef")
+        print(f"3. You can find it in the URL: notion.so/[workspace]/[DATABASE_ID]?v=...")
+        print(f"4. Or if using a page URL: notion.so/[DATABASE_ID]")
+        print(f"\nIf your URL looks like:")
+        print(f"  notion.so/myworkspace/abc123def456?v=...")
+        print(f"  Then DATABASE_ID = 'abc123def456' (the part before ?v=)")
+        raise
+
+    property_types = {}
+
+    # First try to get properties from database schema
+    properties = database.get("properties", {})
+
+    # If properties is empty, fetch from a page instead (handles synced databases)
+    if not properties:
+        print("Database schema empty, fetching property types from pages...")
+        headers = {
+            'Authorization': f'Bearer {NOTION_API_KEY}',
+            'Notion-Version': '2022-06-28',
+            'Content-Type': 'application/json'
+        }
+        with httpx.Client() as client:
+            response = client.post(
+                f'https://api.notion.com/v1/databases/{database_id}/query',
+                headers=headers,
+                json={'page_size': 1}
+            )
+            data = response.json()
+        if 'results' in data and data['results']:
+            properties = data['results'][0].get('properties', {})
+
+    print(f"Found columns: {list(properties.keys())}")
+
+    for name, prop in properties.items():
+        property_types[name] = prop.get("type")
+
+    return property_types
+
+
+def find_column_name(property_types: dict, target: str) -> str | None:
+    """Find the actual column name (case-insensitive match)."""
+    target_lower = target.lower().replace(" ", "").replace("_", "")
+    for name in property_types.keys():
+        name_lower = name.lower().replace(" ", "").replace("_", "")
+        if name_lower == target_lower:
+            return name
+    return None
+
+
+def process_database(notion: Client, database_id: str):
+    """Process all pages in the database."""
+    property_types = get_database_property_types(notion, database_id)
+    
+    # Show available columns for debugging
+    print(f"\nAvailable columns in your database:")
+    for name, prop_type in property_types.items():
+        print(f"  - '{name}' (type: {prop_type})")
+    print()
+    
+    # Map configured column names to actual column names (case-insensitive)
+    column_mapping = {}
+    config_columns = {
+        "arxiv_link": ARXIV_LINK_COLUMN,
+        "title": TITLE_COLUMN,
+        "author": AUTHOR_COLUMN,
+        "released_date": RELEASED_DATE_COLUMN,
+    }
+    
+    missing = []
+    for key, configured_name in config_columns.items():
+        actual_name = find_column_name(property_types, configured_name)
+        if actual_name:
+            column_mapping[key] = actual_name
+            if actual_name != configured_name:
+                print(f"Mapped '{configured_name}' -> '{actual_name}'")
+        else:
+            missing.append(configured_name)
+    
+    if missing:
+        print(f"\nError: Could not find these columns: {missing}")
+        print(f"\nPlease update the column name constants at the top of the script to match your database.")
+        print(f"Current configuration:")
+        print(f"  ARXIV_LINK_COLUMN = \"{ARXIV_LINK_COLUMN}\"")
+        print(f"  TITLE_COLUMN = \"{TITLE_COLUMN}\"")
+        print(f"  AUTHOR_COLUMN = \"{AUTHOR_COLUMN}\"")
+        print(f"  RELEASED_DATE_COLUMN = \"{RELEASED_DATE_COLUMN}\"")
+        return
+    
+    # Use the actual column names from the database
+    arxiv_col = column_mapping["arxiv_link"]
+    title_col = column_mapping["title"]
+    author_col = column_mapping["author"]
+    date_col = column_mapping["released_date"]
+    
+    # Query all pages in the database
+    import httpx
+
+    pages = []
+    cursor = None
+    headers = {
+        'Authorization': f'Bearer {NOTION_API_KEY}',
+        'Notion-Version': '2022-06-28',
+        'Content-Type': 'application/json'
+    }
+
+    with httpx.Client() as client:
+        while True:
+            body = {}
+            if cursor:
+                body['start_cursor'] = cursor
+
+            resp = client.post(
+                f'https://api.notion.com/v1/databases/{database_id}/query',
+                headers=headers,
+                json=body
+            )
+            response = resp.json()
+            pages.extend(response.get("results", []))
+
+            if not response.get("has_more"):
+                break
+            cursor = response.get("next_cursor")
+    
+    print(f"Found {len(pages)} pages in database")
+    
+    updated_count = 0
+    skipped_count = 0
+    error_count = 0
+    
+    for page in pages:
+        page_id = page["id"]
+        
+        # Get arXiv link
+        arxiv_link = get_property_value(page, arxiv_col)
+        if not arxiv_link:
+            print(f"Page {page_id[:8]}...: No arXiv link, skipping")
+            skipped_count += 1
+            continue
+        
+        # Check if Title is already filled
+        existing_title = get_property_value(page, title_col)
+        if existing_title:
+            print(f"Page {page_id[:8]}...: Title already filled ('{existing_title[:30]}...'), skipping")
+            skipped_count += 1
+            continue
+        
+        # Extract arXiv ID
+        arxiv_id = extract_arxiv_id(arxiv_link)
+        if not arxiv_id:
+            print(f"Page {page_id[:8]}...: Could not extract arXiv ID from '{arxiv_link}'")
+            error_count += 1
+            continue
+        
+        print(f"Page {page_id[:8]}...: Fetching metadata for arXiv:{arxiv_id}")
+        
+        # Fetch metadata
+        metadata = fetch_arxiv_metadata(arxiv_id)
+        if not metadata:
+            error_count += 1
+            continue
+        
+        # Update Notion page
+        try:
+            update_notion_page_dynamic(notion, page_id, metadata, property_types, 
+                                       title_col, author_col, date_col)
+            print(f"  Updated: {metadata['title'][:50]}...")
+            updated_count += 1
+        except Exception as e:
+            print(f"  Error updating page: {e}")
+            error_count += 1
+    
+    print(f"\nSummary:")
+    print(f"  Updated: {updated_count}")
+    print(f"  Skipped: {skipped_count}")
+    print(f"  Errors: {error_count}")
+
+
+def main():
+    if not NOTION_API_KEY:
+        print("Error: NOTION_API_KEY environment variable not set")
+        print("Set it with: export NOTION_API_KEY='your-api-key'")
+        return
+    
+    if DATABASE_ID == "your-database-id-here":
+        print("Error: Please update DATABASE_ID with your actual database ID")
+        print("You can find it in your database URL: notion.so/[workspace]/[DATABASE_ID]?...")
+        return
+    
+    notion = Client(auth=NOTION_API_KEY)
+    
+    print(f"Processing Notion database: {DATABASE_ID}")
+    process_database(notion, DATABASE_ID)
+
+
+if __name__ == "__main__":
+    main()
